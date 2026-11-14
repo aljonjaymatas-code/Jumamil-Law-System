@@ -116,4 +116,4 @@ $db = null;
         </table>
     </div>
 </section>
-<?php renderAppEnd(); ?>
+<?php renderAppEnd(); ?>0
