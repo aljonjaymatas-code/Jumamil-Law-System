@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/layout.php';
 ensureSchema();
 requireLogin();
 
@@ -10,6 +11,7 @@ $uploadError = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $title = trim($_POST['title'] ?? 'Untitled Document');
     $category = trim($_POST['category'] ?? 'Affidavit');
+    $recordType = trim($_POST['record_type'] ?? 'archive_record');
     $clientName = trim($_POST['client_name'] ?? '');
     $selectedClientId = (int)($_POST['client_id'] ?? 0);
     $documentNumber = trim($_POST['document_number'] ?? '');
@@ -26,7 +28,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    if (!isset($_FILES['document_file']) || $_FILES['document_file']['error'] !== UPLOAD_ERR_OK) {
+    if (!in_array($recordType, ['archive_record', 'draft'], true)) {
+        $uploadError = 'Select a valid record type.';
+    } elseif (!isset($_FILES['document_file']) || $_FILES['document_file']['error'] !== UPLOAD_ERR_OK) {
         $uploadError = 'Please select a valid file to upload.';
     } else {
         $originalName = basename($_FILES['document_file']['name']);
@@ -53,13 +57,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 $documentNumber = $documentNumber !== '' ? $documentNumber : 'AUTO-' . date('YmdHis');
                 $stmt = $db->prepare(
-                    'INSERT INTO documents (client_id, title, category, client_name, document_number, page_number, book_number, series_year, date_notarized, file_name, stored_path, status, notes, ocr_status, created_by, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())'
+                    'INSERT INTO documents (client_id, title, category, record_type, client_name, document_number, page_number, book_number, series_year, date_notarized, file_name, stored_path, status, notes, ocr_status, created_by, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())'
                 );
                 $stmt->execute([
                     $clientId,
                     $title,
                     $category,
+                    $recordType,
                     $clientName,
                     $documentNumber,
                     $pageNumber,
@@ -119,7 +124,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $update = $db->prepare(
-                    'UPDATE documents SET client_id = ?, client_name = ?, document_number = ?, page_number = ?, book_number = ?, series_year = ?, date_notarized = ?, ocr_status = ?, ocr_text = ?, updated_at = NOW() WHERE id = ?'
+                    'UPDATE documents SET client_id = ?, client_name = ?, document_number = ?, page_number = ?, book_number = ?, series_year = ?, date_notarized = ?, ocr_status = ?, ocr_text = ?, draft_content = ?, updated_at = NOW() WHERE id = ?'
                 );
                 $update->execute([
                     $clientId,
@@ -131,6 +136,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $effectiveDate,
                     ocrStatusLabel($ocr),
                     $ocr['text'] ?? '',
+                    $recordType === 'draft' ? plainTextToRichText((string)($ocr['text'] ?? '')) : null,
                     $documentId,
                 ]);
                 logActivity($documentId, ($ocr['status'] ?? '') === 'completed' ? 'ocr.completed' : 'ocr.failed', [
@@ -154,104 +160,132 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 ?>
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Upload Document</title>
-    <link rel="stylesheet" href="assets/styles.css">
-</head>
-<body>
-    <div class="page-shell narrow">
-        <aside class="sidebar">
-            <div class="brand">Jumamil Law</div>
-            <nav>
-                <a href="dashboard.php">Dashboard</a>
-                <a class="active" href="upload.php">Upload Document</a>
-                <a href="logout.php">Logout</a>
-            </nav>
-        </aside>
+<?php renderAppStart('Upload a document', 'upload', 'Add a client-linked file to the archive. OCR will read available text and metadata after upload.', 'upload-view'); ?>
+<?php if ($uploadError !== '') : ?>
+    <div class="error-box" role="alert"><?= htmlspecialchars($uploadError) ?></div>
+<?php endif; ?>
 
-        <main class="main-panel">
-            <header class="topbar">
-                <div>
-                    <p class="eyebrow">Document Intake</p>
-                    <h2>Upload legal file</h2>
-                </div>
-            </header>
-
-            <?php if (!empty($uploadError)) : ?>
-                <div class="error-box"><?= htmlspecialchars($uploadError) ?></div>
-            <?php endif; ?>
-
-            <section class="panel form-panel">
-                <form method="post" enctype="multipart/form-data">
-                    <div class="form-grid">
-                        <div>
-                            <label for="title">Document Title</label>
-                            <input id="title" name="title" type="text" required>
-                        </div>
-                        <div>
-                            <label for="category">Category</label>
-                            <select id="category" name="category">
-                                <option value="Affidavit">Affidavit</option>
-                                <option value="Special Power of Attorney">Special Power of Attorney</option>
-                                <option value="Deed of Sale">Deed of Sale</option>
-                                <option value="Pleading">Pleading</option>
-                                <option value="Contract">Contract</option>
-                            </select>
-                        </div>
-                        <div>
-                            <label for="client_id">Existing Client</label>
-                            <select id="client_id" name="client_id">
-                                <option value="">Create new client</option>
-                                <?php foreach ($clients as $client) : ?>
-                                    <option value="<?= (int)$client['id'] ?>"><?= htmlspecialchars($client['full_name']) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <div>
-                            <label for="client_name">Client Name</label>
-                            <input id="client_name" name="client_name" type="text" placeholder="New client or override current selection">
-                        </div>
-                        <div>
-                            <label for="document_number">Document Number</label>
-                            <input id="document_number" name="document_number" type="text">
-                        </div>
-                        <div>
-                            <label for="page_number">Page Number</label>
-                            <input id="page_number" name="page_number" type="text">
-                        </div>
-                        <div>
-                            <label for="book_number">Book Number</label>
-                            <input id="book_number" name="book_number" type="text">
-                        </div>
-                        <div>
-                            <label for="series_year">Series Year</label>
-                            <input id="series_year" name="series_year" type="text">
-                        </div>
-                        <div>
-                            <label for="date_notarized">Date Notarized</label>
-                            <input id="date_notarized" name="date_notarized" type="date">
-                        </div>
-                        <div class="full-span">
-                            <label for="document_file">File</label>
-                            <input id="document_file" name="document_file" type="file" accept=".pdf,.doc,.docx,.txt" required>
-                        </div>
-                        <div class="full-span">
-                            <label for="notes">Internal Notes</label>
-                            <textarea id="notes" name="notes" rows="4"></textarea>
-                        </div>
-                    </div>
-
-                    <div class="button-row">
-                        <button type="submit" class="primary-btn">Save Document</button>
-                        <a class="secondary-btn" href="dashboard.php">Cancel</a>
-                    </div>
-                </form>
-            </section>
-        </main>
+<section class="panel form-panel upload-panel">
+    <div class="panel-header">
+        <div>
+            <p class="eyebrow">New archive record</p>
+            <h2>Document details</h2>
+        </div>
+        <span class="role-pill">Staff intake</span>
     </div>
-</body>
-</html>
+    <form method="post" enctype="multipart/form-data">
+        <div class="form-grid">
+            <div>
+                <label for="title">Document title</label>
+                <input id="title" name="title" type="text" placeholder="e.g. Affidavit of support" required>
+            </div>
+            <div>
+                <label for="category">Document category</label>
+                <select id="category" name="category">
+                    <option value="Affidavit">Affidavit</option>
+                    <option value="Special Power of Attorney">Special Power of Attorney</option>
+                    <option value="Deed of Sale">Deed of Sale</option>
+                    <option value="Pleading">Pleading</option>
+                    <option value="Contract">Contract</option>
+                </select>
+            </div>
+            <div>
+                <label for="record_type">Record type</label>
+                <select id="record_type" name="record_type" required>
+                    <option value="archive_record" selected>Scanned archive record (read-only)</option>
+                    <option value="draft">Draft for editing</option>
+                </select>
+                <small class="field-hint">Scanned files are read-only; drafts can be edited.</small>
+            </div>
+            <div>
+                <label for="client_id">Select an existing client</label>
+                <select id="client_id" name="client_id">
+                    <option value="">Choose an existing client (optional)</option>
+                    <?php foreach ($clients as $client) : ?>
+                        <option value="<?= (int)$client['id'] ?>" data-client-name="<?= htmlspecialchars($client['full_name'], ENT_QUOTES, 'UTF-8') ?>" title="<?= htmlspecialchars($client['full_name'], ENT_QUOTES, 'UTF-8') ?>"><?= htmlspecialchars($client['full_name']) ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <small class="field-hint">Open the list to view existing client names, or hover over a name for its full text.</small>
+            </div>
+            <div>
+                <label for="client_name">Client name (existing or new)</label>
+                <input id="client_name" name="client_name" type="text" list="existing-client-names" placeholder="Search or enter a client name">
+                <datalist id="existing-client-names">
+                    <?php foreach ($clients as $client) : ?>
+                        <option value="<?= htmlspecialchars($client['full_name'], ENT_QUOTES, 'UTF-8') ?>"></option>
+                    <?php endforeach; ?>
+                </datalist>
+                <small id="client-link-status" class="field-hint" aria-live="polite">Start typing to match an existing client or enter a new name.</small>
+            </div>
+            <div>
+                <label for="document_number">Document number</label>
+                <input id="document_number" name="document_number" type="text">
+            </div>
+            <div>
+                <label for="date_notarized">Date notarized</label>
+                <input id="date_notarized" name="date_notarized" type="date">
+            </div>
+            <div>
+                <label for="page_number">Page number</label>
+                <input id="page_number" name="page_number" type="text">
+            </div>
+            <div>
+                <label for="book_number">Book number</label>
+                <input id="book_number" name="book_number" type="text">
+            </div>
+            <div>
+                <label for="series_year">Series year</label>
+                <input id="series_year" name="series_year" type="text">
+            </div>
+            <div class="upload-notes-field">
+                <label for="notes">Internal notes</label>
+                <textarea id="notes" name="notes" rows="2" placeholder="Optional notes for the attorney review process"></textarea>
+            </div>
+            <div class="upload-file-field full-span">
+                <label for="document_file">Document file</label>
+                <input id="document_file" name="document_file" type="file" accept=".pdf,.doc,.docx,.txt" required>
+                <small class="field-hint">Stored on the server; originals are not sent to workstations.</small>
+            </div>
+        </div>
+        <div class="button-row">
+            <button type="submit" class="primary-btn">Save and process document</button>
+            <a class="secondary-btn" href="dashboard.php">Cancel</a>
+        </div>
+    </form>
+</section>
+<script>
+(() => {
+    const clientSelect = document.getElementById('client_id');
+    const clientName = document.getElementById('client_name');
+    const clientStatus = document.getElementById('client-link-status');
+
+    clientSelect.addEventListener('change', () => {
+        const selectedOption = clientSelect.selectedOptions[0];
+        if (clientSelect.value !== '') {
+            clientName.value = selectedOption.dataset.clientName || selectedOption.textContent.trim();
+            clientStatus.textContent = `Existing client selected: ${clientName.value}`;
+        } else {
+            clientStatus.textContent = clientName.value.trim()
+                ? 'This name will match an existing client if available; otherwise a new client record will be created.'
+                : 'Start typing to match an existing client or enter a new name.';
+        }
+    });
+
+    clientName.addEventListener('input', () => {
+        const enteredName = clientName.value.trim().toLocaleLowerCase();
+        const matchingOption = Array.from(clientSelect.options).find(option =>
+            option.value !== '' && (option.dataset.clientName || option.textContent).trim().toLocaleLowerCase() === enteredName
+        );
+
+        clientSelect.value = matchingOption ? matchingOption.value : '';
+        if (matchingOption) {
+            clientStatus.textContent = `Existing client selected: ${matchingOption.dataset.clientName || matchingOption.textContent.trim()}`;
+        } else if (enteredName !== '') {
+            clientStatus.textContent = 'A client record will be created for this name.';
+        } else {
+            clientStatus.textContent = 'Start typing to match an existing client or enter a new name.';
+        }
+    });
+})();
+</script>
+<?php renderAppEnd(); ?>

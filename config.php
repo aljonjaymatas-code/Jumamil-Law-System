@@ -10,6 +10,7 @@ const DB_USER = 'root';
 const DB_PASS = '';
 const UPLOAD_DIR = __DIR__ . '/uploads';
 const OCR_SCRIPT = __DIR__ . '/scripts/ocr_worker.py';
+const PDF_PREVIEW_SCRIPT = __DIR__ . '/scripts/pdf_page_preview.py';
 const OCR_PYTHON = 'python';
 const ROLE_STAFF = 'staff';
 const ROLE_ATTORNEY = 'attorney';

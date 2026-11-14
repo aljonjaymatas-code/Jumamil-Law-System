@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/layout.php';
 ensureSchema();
 requireLogin();
 
@@ -15,6 +16,10 @@ if (!$document) {
 }
 
 $pageError = '';
+$submittedDraftContent = null;
+if (!isset($_SESSION['draft_editor_csrf'])) {
+    $_SESSION['draft_editor_csrf'] = bin2hex(random_bytes(32));
+}
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
@@ -33,6 +38,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             logActivity($id, 'document.reviewed', ['decision' => $status]);
             header('Location: document.php?id=' . $id . '&saved=review');
             exit;
+        }
+    } elseif ($action === 'save_draft') {
+        if (currentRole() !== ROLE_STAFF) {
+            $pageError = 'Only staff can edit draft content.';
+        } elseif (
+            !is_string($_POST['csrf_token'] ?? null)
+            || !is_string($_SESSION['draft_editor_csrf'] ?? null)
+            || !hash_equals($_SESSION['draft_editor_csrf'], $_POST['csrf_token'])
+        ) {
+            $pageError = 'The editor session expired. Reload the page before saving again.';
+        } else {
+            $rawDraftContent = is_string($_POST['draft_content'] ?? null) ? $_POST['draft_content'] : '';
+            try {
+                $submittedDraftContent = sanitizeRichText($rawDraftContent);
+            } catch (InvalidArgumentException $exception) {
+                $pageError = $exception->getMessage();
+            }
+
+            if ($pageError === '') {
+                $db->beginTransaction();
+                $lock = $db->prepare('SELECT record_type, status FROM documents WHERE id = ? FOR UPDATE');
+                $lock->execute([$id]);
+                $currentDocument = $lock->fetch();
+                if (
+                    !$currentDocument
+                    || $currentDocument['record_type'] !== 'draft'
+                    || !in_array($currentDocument['status'], ['Draft', 'Needs Revision'], true)
+                ) {
+                    $db->rollBack();
+                    $pageError = 'This record is no longer an editable draft.';
+                } else {
+                    $save = $db->prepare('UPDATE documents SET draft_content = ?, updated_at = NOW() WHERE id = ?');
+                    $save->execute([$submittedDraftContent, $id]);
+                    logActivity($id, 'document.draft_content_saved', [
+                        'character_count' => mb_strlen(strip_tags($submittedDraftContent), 'UTF-8'),
+                    ]);
+                    $db->commit();
+                    header('Location: document.php?id=' . $id . '&saved=draft');
+                    exit;
+                }
+            }
         }
     } elseif ($action === 'version') {
         $upload = $_FILES['document_file'] ?? null;
@@ -59,7 +105,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     );
                     $ocr = runOcrPipeline($targetPath);
                     $update = $db->prepare(
-                        'UPDATE documents SET file_name = ?, stored_path = ?, status = ?, reviewed_by = NULL, ocr_status = ?, ocr_text = ?, document_number = COALESCE(?, document_number), page_number = COALESCE(?, page_number), book_number = COALESCE(?, book_number), series_year = COALESCE(?, series_year), date_notarized = COALESCE(?, date_notarized), updated_at = NOW() WHERE id = ?'
+                        'UPDATE documents SET file_name = ?, stored_path = ?, status = ?, reviewed_by = NULL, ocr_status = ?, ocr_text = ?, draft_content = IF(record_type = ?, ?, draft_content), document_number = COALESCE(?, document_number), page_number = COALESCE(?, page_number), book_number = COALESCE(?, book_number), series_year = COALESCE(?, series_year), date_notarized = COALESCE(?, date_notarized), updated_at = NOW() WHERE id = ?'
                     );
                     $update->execute([
                         $originalName,
@@ -67,6 +113,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'Under Review',
                         ocrStatusLabel($ocr),
                         $ocr['text'] ?? '',
+                        'draft',
+                        plainTextToRichText((string)($ocr['text'] ?? '')),
                         $ocr['document_number'] ?? null,
                         $ocr['page_number'] ?? null,
                         $ocr['book_number'] ?? null,
@@ -101,52 +149,57 @@ $reviewsStmt = $db->prepare('SELECT r.*, u.name AS reviewer_name FROM document_r
 $reviewsStmt->execute([$id]);
 $reviews = $reviewsStmt->fetchAll();
 
-$activityStmt = $db->prepare('SELECT a.*, u.name AS user_name FROM activity_logs a LEFT JOIN users u ON u.id = a.user_id WHERE a.document_id = ? ORDER BY a.created_at DESC LIMIT 50');
-$activityStmt->execute([$id]);
-$activity = $activityStmt->fetchAll();
-
 $storedPath = $document['stored_path'] ?? '';
 $previewExtension = $storedPath !== '' ? strtolower(pathinfo($storedPath, PATHINFO_EXTENSION)) : '';
+$recordType = $document['record_type'] ?? 'archive_record';
+$canEditDraft = $recordType === 'draft'
+    && currentRole() === ROLE_STAFF
+    && in_array($document['status'], ['Draft', 'Needs Revision'], true);
+$draftContent = $submittedDraftContent ?? (string)($document['draft_content'] ?? '');
+if ($recordType === 'draft' && $draftContent === '' && !empty($document['ocr_text'])) {
+    $draftContent = plainTextToRichText((string)$document['ocr_text']);
+}
+if ($recordType === 'draft') {
+    $draftContent = sanitizeRichText($draftContent);
+}
 ?>
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document Details</title>
-    <link rel="stylesheet" href="assets/styles.css">
-</head>
-<body>
-    <div class="page-shell narrow">
-        <aside class="sidebar">
-            <div class="brand">Jumamil Law</div>
-            <nav>
-                <a href="dashboard.php">Dashboard</a>
-                <a href="upload.php">Upload Document</a>
-                <a href="logout.php">Logout</a>
-            </nav>
-        </aside>
+<?php renderAppStart($document['title'], currentRole() === ROLE_ATTORNEY ? 'review' : 'dashboard', 'Review document details, protected previews, and workflow actions.'); ?>
+<?php if ($pageError !== '') : ?>
+    <div class="error-box" role="alert"><?= htmlspecialchars($pageError) ?></div>
+<?php elseif (($_GET['saved'] ?? '') === 'review') : ?>
+    <div class="success-box" role="status">Review decision saved.</div>
+<?php elseif (($_GET['saved'] ?? '') === 'draft') : ?>
+    <div class="success-box" role="status">Draft saved. Staff and Attorney dashboards now show the same saved content.</div>
+<?php elseif (($_GET['saved'] ?? '') === 'version') : ?>
+    <div class="success-box" role="status">New version uploaded and returned to the attorney review queue.</div>
+<?php endif; ?>
 
-        <main class="main-panel">
-            <header class="topbar">
-                <div>
-                    <p class="eyebrow">Document Record</p>
-                    <h2><?= htmlspecialchars($document['title']) ?></h2>
-                </div>
-                <span class="status-badge"><?= htmlspecialchars($document['status']) ?></span>
-            </header>
-
-            <?php if ($pageError !== '') : ?>
-                <div class="error-box"><?= htmlspecialchars($pageError) ?></div>
-            <?php elseif (($_GET['saved'] ?? '') === 'review') : ?>
-                <div class="success-box">Review decision saved.</div>
-            <?php elseif (($_GET['saved'] ?? '') === 'version') : ?>
-                <div class="success-box">New version uploaded and returned to the attorney review queue.</div>
-            <?php endif; ?>
-
-            <section class="panel">
-                <div class="detail-grid">
+<section class="panel document-record-panel">
+    <div class="panel-header">
+        <div>
+            <p class="eyebrow">Document overview</p>
+            <h2>Record details</h2>
+        </div>
+        <span class="status-badge <?= appStatusClass($document['status']) ?>"><?= htmlspecialchars($document['status']) ?></span>
+    </div>
+                <nav class="document-section-nav" aria-label="Document sections">
+                    <a href="#document-overview">Overview</a>
+                    <?php if ($recordType === 'draft') : ?>
+                        <a href="#draft-editor">Draft content</a>
+                    <?php endif; ?>
+                    <?php if ($storedPath !== '' && is_file($storedPath)) : ?>
+                        <a href="#document-preview">Preview</a>
+                    <?php endif; ?>
+                    <a href="#document-versions">Versions</a>
+                    <a href="#document-version-upload">Upload version</a>
+                    <?php if (currentRole() === ROLE_ATTORNEY) : ?>
+                        <a href="#attorney-review">Attorney review</a>
+                    <?php endif; ?>
+                    <a href="#review-history">Review history</a>
+                </nav>
+                <div class="detail-grid" id="document-overview">
                     <div><strong>Category</strong><p><?= htmlspecialchars($document['category']) ?></p></div>
+                    <div><strong>Record Type</strong><p><?= $recordType === 'draft' ? 'Draft document' : 'Scanned archive record' ?></p></div>
                     <div><strong>Client</strong><p><?= htmlspecialchars($document['client_name'] ?: 'N/A') ?></p></div>
                     <div><strong>Document Number</strong><p><?= htmlspecialchars($document['document_number'] ?? '') ?></p></div>
                     <div><strong>Page Number</strong><p><?= htmlspecialchars($document['page_number'] ?? '') ?></p></div>
@@ -159,117 +212,170 @@ $previewExtension = $storedPath !== '' ? strtolower(pathinfo($storedPath, PATHIN
                     <div><strong>Reviewed By</strong><p><?= htmlspecialchars($document['reviewed_by_name'] ?: 'Pending') ?></p></div>
                 </div>
 
-                <?php if ($storedPath !== '' && is_file($storedPath)) : ?>
-                    <div class="preview-panel">
-                        <h4>Document Preview</h4>
-                        <?php if ($previewExtension === 'pdf') : ?>
-                            <iframe class="pdf-preview" src="file.php?id=<?= $id ?>" title="PDF Preview"></iframe>
-                        <?php else : ?>
-                            <p><a href="file.php?id=<?= $id ?>">Download current file</a></p>
-                            <pre class="file-preview"><?= htmlspecialchars($document['ocr_text'] ?: 'No extracted text available yet.') ?></pre>
-                        <?php endif; ?>
-                    </div>
-                <?php endif; ?>
-
-                <section class="history-section">
-                    <h3>Document Versions</h3>
-                    <?php if (!$versions) : ?>
-                        <p class="muted">No version history is available.</p>
-                    <?php else : ?>
-                        <div class="history-list">
-                            <?php foreach ($versions as $version) : ?>
-                                <article class="history-item">
-                                    <div>
-                                        <strong>Version <?= (int)$version['version_number'] ?> — <?= htmlspecialchars($version['file_name']) ?></strong>
-                                        <p><?= htmlspecialchars($version['change_note'] ?: 'No change note') ?></p>
-                                        <small><?= htmlspecialchars($version['uploaded_by_name'] ?: 'Former user') ?> · <?= htmlspecialchars($version['created_at']) ?> · <?= number_format((int)$version['file_size']) ?> bytes · SHA-256 <?= htmlspecialchars($version['sha256']) ?></small>
-                                    </div>
-                                    <a href="file.php?id=<?= $id ?>&amp;version=<?= (int)$version['id'] ?>">Open file</a>
-                                </article>
-                            <?php endforeach; ?>
+                <?php if ($recordType === 'draft') : ?>
+                    <section class="panel draft-editor-panel" id="draft-editor">
+                        <div class="panel-header">
+                            <div>
+                                <p class="eyebrow">Built-in text editor</p>
+                                <h2>Draft content</h2>
+                            </div>
+                            <span class="role-pill"><?= $canEditDraft ? 'Editing enabled' : 'Read-only' ?></span>
                         </div>
-                    <?php endif; ?>
-                </section>
-
-                <form method="post" enctype="multipart/form-data" class="review-form">
-                    <input type="hidden" name="action" value="version">
-                    <h3>Upload New Version</h3>
-                    <label for="document_file">Replacement or updated document</label>
-                    <input id="document_file" name="document_file" type="file" accept=".pdf,.doc,.docx,.txt" required>
-                    <label for="change_note">Version note</label>
-                    <textarea id="change_note" name="change_note" rows="3" placeholder="Describe the change or scan batch"></textarea>
-                    <button type="submit" class="secondary-btn">Upload Version</button>
-                </form>
-
-                <?php if (currentRole() === ROLE_ATTORNEY) : ?>
-                    <form method="post" class="review-form">
-                        <input type="hidden" name="action" value="review">
-                        <h3>Attorney Pre-Printing Review</h3>
-                        <label for="status">Decision</label>
-                        <select id="status" name="status">
-                            <?php foreach (['Draft', 'Under Review', 'Needs Revision', 'Approved for Printing'] as $status) : ?>
-                                <option value="<?= htmlspecialchars($status) ?>" <?= $document['status'] === $status ? 'selected' : '' ?>><?= htmlspecialchars($status) ?></option>
-                            <?php endforeach; ?>
-                        </select>
-
-                        <label for="notes">Review Notes</label>
-                        <textarea id="notes" name="notes" rows="5"><?= htmlspecialchars($document['notes'] ?? '') ?></textarea>
-                        <button type="submit" class="primary-btn">Save Review</button>
-                    </form>
-                <?php else : ?>
-                    <div class="notes-box">
-                        <h4>Review Notes</h4>
-                        <p><?= htmlspecialchars($document['notes'] ?? 'No notes available.') ?></p>
-                    </div>
-                <?php endif; ?>
-
-                <section class="history-section">
-                    <h3>Attorney Review History</h3>
-                    <?php if (!$reviews) : ?>
-                        <p class="muted">No attorney review actions recorded yet.</p>
-                    <?php else : ?>
-                        <div class="history-list">
-                            <?php foreach ($reviews as $review) : ?>
-                                <article class="history-item">
-                                    <div>
-                                        <strong><?= htmlspecialchars($review['decision']) ?></strong>
-                                        <p><?= nl2br(htmlspecialchars($review['remarks'] ?: 'No remarks')) ?></p>
-                                    </div>
-                                    <small><?= htmlspecialchars($review['reviewer_name'] ?: 'Former user') ?> · <?= htmlspecialchars($review['created_at']) ?></small>
-                                </article>
-                            <?php endforeach; ?>
-                        </div>
-                    <?php endif; ?>
-                </section>
-
-                <section class="history-section">
-                    <h3>Activity Log</h3>
-                    <div class="history-list">
-                        <?php foreach ($activity as $item) : ?>
-                            <?php $details = json_decode((string)($item['details'] ?? ''), true) ?: []; ?>
-                            <article class="history-item">
-                                <div>
-                                    <strong><?= htmlspecialchars($item['action']) ?></strong>
-                                    <?php if ($details) : ?>
-                                        <p><?= htmlspecialchars(implode(' · ', array_map(
-                                            static function ($key, $value): string {
-                                                return $key . ': ' . (is_scalar($value) ? (string)$value : json_encode($value));
-                                            },
-                                            array_keys($details),
-                                            array_values($details)
-                                        ))) ?></p>
-                                    <?php endif; ?>
+                        <?php if ($canEditDraft) : ?>
+                            <form method="post" class="draft-editor-form" data-draft-editor>
+                                <input type="hidden" name="action" value="save_draft">
+                                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['draft_editor_csrf'], ENT_QUOTES, 'UTF-8') ?>">
+                                <div class="editor-toolbar" role="toolbar" aria-label="Draft formatting">
+                                    <button type="button" data-command="bold" aria-label="Bold"><strong>B</strong></button>
+                                    <button type="button" data-command="italic" aria-label="Italic"><em>I</em></button>
+                                    <button type="button" data-command="underline" aria-label="Underline"><u>U</u></button>
+                                    <span class="toolbar-divider" aria-hidden="true"></span>
+                                    <select data-block-format aria-label="Text style">
+                                        <option value="p">Paragraph</option>
+                                        <option value="h1">Heading 1</option>
+                                        <option value="h2">Heading 2</option>
+                                        <option value="h3">Heading 3</option>
+                                    </select>
+                                    <button type="button" data-command="insertUnorderedList" aria-label="Bulleted list">Bullets</button>
+                                    <button type="button" data-command="insertOrderedList" aria-label="Numbered list">Numbering</button>
+                                    <span class="toolbar-divider" aria-hidden="true"></span>
+                                    <button type="button" data-command="justifyLeft" aria-label="Align left">Left</button>
+                                    <button type="button" data-command="justifyCenter" aria-label="Center text">Center</button>
+                                    <button type="button" data-command="justifyRight" aria-label="Align right">Right</button>
+                                    <span class="toolbar-divider" aria-hidden="true"></span>
+                                    <button type="button" data-command="undo" aria-label="Undo">Undo</button>
+                                    <button type="button" data-command="redo" aria-label="Redo">Redo</button>
                                 </div>
-                                <small><?= htmlspecialchars($item['user_name'] ?: 'Former user') ?> · <?= htmlspecialchars($item['created_at']) ?></small>
-                            </article>
-                        <?php endforeach; ?>
-                        <?php if (!$activity) : ?>
-                            <p class="muted">No activity recorded yet.</p>
+                                <div
+                                    class="rich-text-surface"
+                                    contenteditable="true"
+                                    role="textbox"
+                                    aria-label="Editable draft content"
+                                    aria-multiline="true"
+                                    spellcheck="true"
+                                    data-rich-text-surface
+                                ><?= $draftContent !== '' ? $draftContent : '<p><br></p>' ?></div>
+                                <input type="hidden" name="draft_content" value="">
+                                <div class="editor-footer">
+                                    <span>Saved content is available to Staff and Attorney from their separate dashboards.</span>
+                                    <div class="editor-actions">
+                                        <button type="button" class="secondary-btn" data-print-draft>Print draft</button>
+                                        <button type="submit" class="primary-btn">Save draft</button>
+                                    </div>
+                                </div>
+                            </form>
+                        <?php elseif ($draftContent !== '') : ?>
+                            <div class="rich-text-readonly"><?= $draftContent ?></div>
+                        <?php else : ?>
+                            <p class="muted">No draft content has been entered yet.</p>
                         <?php endif; ?>
-                    </div>
-                </section>
-            </section>
-        </main>
-    </div>
-</body>
-</html>
+                        <?php if (!$canEditDraft) : ?>
+                            <p class="field-hint">Only Staff can edit a Draft or a document returned as Needs Revision. Scanned archive records remain read-only.</p>
+                        <?php endif; ?>
+                    </section>
+                <?php endif; ?>
+
+                <?php if ($storedPath !== '' && is_file($storedPath)) : ?>
+                    <section class="preview-panel document-preview-panel" id="document-preview">
+                        <div class="section-heading">
+                            <div>
+                                <p class="eyebrow">Protected original</p>
+                                <h3>Document Preview</h3>
+                            </div>
+                            <span class="role-pill">No source-file download</span>
+                        </div>
+                        <?php if ($previewExtension === 'pdf') : ?>
+                            <div class="pdf-page-preview" data-pdf-preview data-document-id="<?= $id ?>">
+                                <div class="pdf-preview-toolbar">
+                                    <button type="button" class="secondary-btn" data-page-previous disabled>Previous page</button>
+                                    <span data-page-indicator>Preparing page preview...</span>
+                                    <button type="button" class="secondary-btn" data-page-next disabled>Next page</button>
+                                </div>
+                                <div class="pdf-preview-canvas">
+                                    <img alt="PDF page preview" data-page-image>
+                                </div>
+                                <p class="preview-message" role="status" data-preview-message>Rendering one page from the protected source file.</p>
+                            </div>
+                        <?php else : ?>
+                            <p class="field-hint">The source file remains on the server. This read-only text view uses the text extracted during OCR.</p>
+                            <pre class="file-preview"><?= htmlspecialchars($document['ocr_text'] ?: 'No extracted text is available for this file.') ?></pre>
+                        <?php endif; ?>
+                    </section>
+                <?php endif; ?>
+
+                <div class="document-support-grid">
+                    <section class="history-section" id="document-versions">
+                        <h3>Document Versions</h3>
+                        <?php if (!$versions) : ?>
+                            <p class="muted">No version history is available.</p>
+                        <?php else : ?>
+                            <div class="history-list">
+                                <?php foreach ($versions as $version) : ?>
+                                    <article class="history-item">
+                                        <div>
+                                            <strong>Version <?= (int)$version['version_number'] ?> — <?= htmlspecialchars($version['file_name']) ?></strong>
+                                            <p><?= htmlspecialchars($version['change_note'] ?: 'No change note') ?></p>
+                                            <small><?= htmlspecialchars($version['uploaded_by_name'] ?: 'Former user') ?> · <?= htmlspecialchars($version['created_at']) ?> · <?= number_format((int)$version['file_size']) ?> bytes · SHA-256 <?= htmlspecialchars($version['sha256']) ?></small>
+                                        </div>
+                                        <span class="read-only-note">Stored in the protected archive; source files are not downloadable.</span>
+                                    </article>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php endif; ?>
+                    </section>
+
+                    <form method="post" enctype="multipart/form-data" class="review-form" id="document-version-upload">
+                        <input type="hidden" name="action" value="version">
+                        <h3>Upload New Version</h3>
+                        <label for="document_file">Replacement or updated document</label>
+                        <input id="document_file" name="document_file" type="file" accept=".pdf,.doc,.docx,.txt" required>
+                        <label for="change_note">Version note</label>
+                        <textarea id="change_note" name="change_note" rows="3" placeholder="Describe the change or scan batch"></textarea>
+                        <button type="submit" class="secondary-btn">Upload Version</button>
+                    </form>
+
+                    <?php if (currentRole() === ROLE_ATTORNEY) : ?>
+                        <form method="post" class="review-form" id="attorney-review">
+                            <input type="hidden" name="action" value="review">
+                            <h3>Attorney Pre-Printing Review</h3>
+                            <label for="status">Decision</label>
+                            <select id="status" name="status">
+                                <?php foreach (['Draft', 'Under Review', 'Needs Revision', 'Approved for Printing'] as $status) : ?>
+                                    <option value="<?= htmlspecialchars($status) ?>" <?= $document['status'] === $status ? 'selected' : '' ?>><?= htmlspecialchars($status) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+
+                            <label for="notes">Review Notes</label>
+                            <textarea id="notes" name="notes" rows="5"><?= htmlspecialchars($document['notes'] ?? '') ?></textarea>
+                            <button type="submit" class="primary-btn">Save Review</button>
+                        </form>
+                    <?php else : ?>
+                        <div class="notes-box">
+                            <h4>Review Notes</h4>
+                            <p><?= htmlspecialchars($document['notes'] ?? 'No notes available.') ?></p>
+                        </div>
+                    <?php endif; ?>
+
+                    <section class="history-section" id="review-history">
+                        <h3>Attorney Review History</h3>
+                        <?php if (!$reviews) : ?>
+                            <p class="muted">No attorney review actions recorded yet.</p>
+                        <?php else : ?>
+                            <div class="history-list">
+                                <?php foreach ($reviews as $review) : ?>
+                                    <article class="history-item">
+                                        <div>
+                                            <strong><?= htmlspecialchars($review['decision']) ?></strong>
+                                            <p><?= nl2br(htmlspecialchars($review['remarks'] ?: 'No remarks')) ?></p>
+                                        </div>
+                                        <small><?= htmlspecialchars($review['reviewer_name'] ?: 'Former user') ?> · <?= htmlspecialchars($review['created_at']) ?></small>
+                                    </article>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php endif; ?>
+                    </section>
+                </div>
+
+</section>
+<script src="assets/document-tools.js" defer></script>
+<?php renderAppEnd(); ?>

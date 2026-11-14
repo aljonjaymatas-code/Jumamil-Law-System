@@ -64,6 +64,7 @@ function ensureSchema(): void
             client_id INT UNSIGNED NULL,
             title VARCHAR(255) NOT NULL,
             category VARCHAR(120) NOT NULL,
+            record_type VARCHAR(24) NOT NULL DEFAULT 'archive_record',
             client_name VARCHAR(200) NULL,
             document_number VARCHAR(120) NULL,
             page_number VARCHAR(50) NULL,
@@ -76,6 +77,7 @@ function ensureSchema(): void
             notes TEXT NULL,
             ocr_status VARCHAR(100) NULL,
             ocr_text LONGTEXT NULL,
+            draft_content LONGTEXT NULL,
             created_by INT UNSIGNED NULL,
             reviewed_by INT UNSIGNED NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -88,6 +90,16 @@ function ensureSchema(): void
             CONSTRAINT fk_documents_reviewed_by FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     );
+
+    $recordTypeColumn = $db->query("SHOW COLUMNS FROM documents LIKE 'record_type'")->fetch();
+    if (!$recordTypeColumn) {
+        $db->exec("ALTER TABLE documents ADD COLUMN record_type VARCHAR(24) NOT NULL DEFAULT 'archive_record' AFTER category");
+    }
+
+    $draftContentColumn = $db->query("SHOW COLUMNS FROM documents LIKE 'draft_content'")->fetch();
+    if (!$draftContentColumn) {
+        $db->exec('ALTER TABLE documents ADD COLUMN draft_content LONGTEXT NULL AFTER ocr_text');
+    }
 
     $db->exec(
         "CREATE TABLE IF NOT EXISTS document_reviews (
@@ -244,9 +256,9 @@ function fetchDocuments(string $search = '', string $notarizedDate = '', string 
     $term = trim($search);
 
     if ($term !== '') {
-        $conditions[] = '(COALESCE(c.full_name, d.client_name) LIKE ? OR d.document_number LIKE ? OR d.title LIKE ? OR d.ocr_text LIKE ?)';
+        $conditions[] = '(COALESCE(c.full_name, d.client_name) LIKE ? OR d.document_number LIKE ? OR d.title LIKE ? OR d.ocr_text LIKE ? OR d.draft_content LIKE ?)';
         $like = '%' . $term . '%';
-        $params = [$like, $like, $like, $like];
+        $params = [$like, $like, $like, $like, $like];
     }
 
     if ($notarizedDate !== '') {
@@ -282,6 +294,101 @@ function logActivity(?int $documentId, string $action, array $details = []): voi
         $action,
         $details ? json_encode($details, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null,
     ]);
+}
+
+function sanitizeRichTextNode(DOMNode $node, array $allowedTags, array $blockedTags): string
+{
+    if ($node->nodeType === XML_TEXT_NODE || $node->nodeType === XML_CDATA_SECTION_NODE) {
+        return htmlspecialchars((string)$node->nodeValue, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+
+    if ($node->nodeType !== XML_ELEMENT_NODE && $node->nodeType !== XML_DOCUMENT_NODE) {
+        return '';
+    }
+
+    $tag = strtolower($node->nodeName);
+    if (isset($blockedTags[$tag])) {
+        return '';
+    }
+
+    $content = '';
+    foreach ($node->childNodes as $child) {
+        $content .= sanitizeRichTextNode($child, $allowedTags, $blockedTags);
+    }
+
+    if (!isset($allowedTags[$tag])) {
+        return $content;
+    }
+    if ($tag === 'br' || $tag === 'hr') {
+        return '<' . $tag . '>';
+    }
+
+    $safeStyle = '';
+    if ($node instanceof DOMElement && $node->hasAttribute('style')) {
+        $style = strtolower($node->getAttribute('style'));
+        if (preg_match('/(?:^|;)\s*text-align\s*:\s*(left|center|right|justify)\s*(?:;|$)/', $style, $match)) {
+            $safeStyle = ' style="text-align:' . $match[1] . '"';
+        }
+    }
+
+    return '<' . $tag . $safeStyle . '>' . $content . '</' . $tag . '>';
+}
+
+function sanitizeRichText(string $html): string
+{
+    if (strlen($html) > 1000000) {
+        throw new InvalidArgumentException('Draft content must be smaller than 1 MB.');
+    }
+    if (!class_exists(DOMDocument::class)) {
+        throw new RuntimeException('The server HTML parser is required to save formatted draft content.');
+    }
+
+    $allowedTags = array_fill_keys([
+        'p', 'br', 'hr', 'strong', 'b', 'em', 'i', 'u', 's', 'sub', 'sup',
+        'h1', 'h2', 'h3', 'h4', 'ul', 'ol', 'li', 'blockquote', 'pre', 'code',
+        'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td',
+    ], true);
+    $blockedTags = array_fill_keys([
+        'script', 'style', 'iframe', 'object', 'embed', 'svg', 'math',
+        'template', 'noscript', 'form', 'input', 'textarea', 'button',
+    ], true);
+
+    $previousErrors = libxml_use_internal_errors(true);
+    $document = new DOMDocument('1.0', 'UTF-8');
+    $loaded = $document->loadHTML(
+        '<?xml encoding="UTF-8"><!doctype html><html><body><div id="draft-content-root">' . $html . '</div></body></html>',
+        LIBXML_HTML_NODEFDTD | LIBXML_NONET
+    );
+    libxml_clear_errors();
+    libxml_use_internal_errors($previousErrors);
+
+    if (!$loaded) {
+        throw new InvalidArgumentException('Draft content could not be parsed.');
+    }
+
+    $xpath = new DOMXPath($document);
+    $roots = $xpath->query('//*[@id="draft-content-root"]');
+    if (!$roots || $roots->length === 0) {
+        throw new InvalidArgumentException('Draft content could not be parsed.');
+    }
+
+    return sanitizeRichTextNode($roots->item(0), $allowedTags, $blockedTags);
+}
+
+function plainTextToRichText(string $text): string
+{
+    $text = trim(str_replace(["\r\n", "\r"], "\n", $text));
+    if ($text === '') {
+        return '<p><br></p>';
+    }
+
+    $paragraphs = preg_split('/\n{2,}/', $text) ?: [];
+    $html = [];
+    foreach ($paragraphs as $paragraph) {
+        $html[] = '<p>' . nl2br(htmlspecialchars(trim($paragraph), false, 'UTF-8')) . '</p>';
+    }
+
+    return sanitizeRichText(implode('', $html));
 }
 
 function validDateFilter(string $date): string
